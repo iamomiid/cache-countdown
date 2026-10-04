@@ -2,9 +2,7 @@
 
 A Claude Code mod that shows how long the prompt cache stays warm, as a fuse above the prompt. It draws in the terminal and in the Code tab of the Claude Desktop app.
 
-```text
-52m ━━━━━━━━━━━━━━━━━━━━━─── 1h   ctx 212k 21%  │  5h 28% 3h41m  │  wk 36% 4d16h
-```
+![Cache Countdown in its three states: warm, about to lapse, and cold](assets/thumbnail.png)
 
 Anthropic's prompt cache has two lifetimes, 5 minutes and 1 hour, priced differently. Every request of the main conversation refreshes the entry. Once it lapses, the next request pays to write the whole context to the cache again. This mod shows how long you have left, and what it costs when the time runs out.
 
@@ -41,7 +39,19 @@ A mod runs with your permissions. To see what this one hooks and calls before lo
 
 ## What it shows
 
-One row above the prompt:
+One row above the prompt. In the Desktop app:
+
+![The Cache Countdown row above the prompt box in the Claude Desktop app](assets/preview.png)
+
+In a terminal:
+
+```text
+52m ━━━━━━━━━━━━━━━━━━━━━─── 1h   ctx 212k 21%  │  5h 28% 3h41m  │  wk 36% 4d16h
+```
+
+Both images on this page are illustrations drawn to match the app, with example figures.
+
+The row holds:
 
 - **The time left**, then a fuse that shortens as the cache ages. In the Desktop app the fuse is a hairline with a notch every 10 minutes (1h) or every minute (5m). In the terminal it is a run of line characters.
 - **The lifetime in play**, `5m` or `1h`.
