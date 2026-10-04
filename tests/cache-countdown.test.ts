@@ -402,3 +402,28 @@ test('keeps what other mods draw in the band', { options: { ttl: '5m' } }, async
     await ui.unmount()
   }
 })
+
+test('Compact also appears once the cache is cold', { options: { ttl: '5m' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  answerBand(on)
+  answerSteps(on, CACHED)
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  await $.session.measure({
+    context: { tokens: 120_000, window: 1_000_000, percent: 12 },
+    rateLimits: [],
+    changed: ['context'],
+  })
+  await step($)
+
+  const warm = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await warm.find({ type: 'Button', key: 'compact' })).toBeUndefined()
+  await warm.unmount()
+
+  await clock.advance(301_000)
+  for (const surface of SURFACES) {
+    const cold = await $.ui.mount({ ...BAND, surface })
+    expect(await cold.find({ type: 'Text', text: /^cold$/ })).toBeDefined()
+    expect(await cold.find({ type: 'Button', key: 'compact' })).toBeDefined()
+    await cold.unmount()
+  }
+})

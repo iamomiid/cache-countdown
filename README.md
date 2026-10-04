@@ -67,7 +67,7 @@ If another mod draws above the prompt too, its row stays, under this one.
 ## Buttons
 
 - **Keep warm** appears while the cache is about to lapse. It asks the model one short question over the conversation as it was last sent, which reads the cache and restarts its lifetime. That request is real usage: the whole context at the cache-read price. A toast says how many tokens were read. If the request wrote the context again instead of reading it, the toast says so and the countdown stays as it was.
-- **Compact** appears beside the context meter once the conversation holds more than 200k tokens. It compacts the conversation, as `/compact` does, with no confirmation step.
+- **Compact** appears beside the context meter once the conversation holds more than 200k tokens, and whenever the cache is cold and the conversation holds 20k tokens or more. It compacts the conversation, as `/compact` does, with no confirmation step. Compacting a cold conversation still reads the whole context once, as any next message would; what it saves is carrying that context into every message after.
 
 ## Options
 

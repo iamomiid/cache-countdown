@@ -82,7 +82,7 @@ const TERMINAL_CELLS = 24
 const TAIL_BYTES = 400_000
 const EXPIRY_TOAST_WINDOW_MS = 10_000
 const REBUILD_MIN_TOKENS = 10_000
-const TOAST_MIN_TOKENS = 20_000
+const WORTH_ACTING_TOKENS = 20_000
 const COMPACT_MIN_TOKENS = 200_000
 const KEEP_WARM_PROMPT = 'Reply with the single word: ok'
 const NO_GAUGES: Gauges = { tokens: null, meters: [] }
@@ -493,7 +493,7 @@ async function tick(
     $.ui.invalidate('ui.render')
   }
 
-  const isWorthIt = held.tokens === null || held.tokens >= TOAST_MIN_TOKENS
+  const isWorthIt = held.tokens === null || held.tokens >= WORTH_ACTING_TOKENS
 
   if (isToasting && view.isKnown && isWorthIt && flying === 0) {
     announce($, view)
@@ -511,12 +511,15 @@ async function sceneOf($: EngineInterface, forced: CacheTier | null): Promise<Sc
   const now = await $.clock.now()
   const view = last === null ? null : viewOf(last, forced, await read($, tiers), held.tokens, now)
 
+  const tokens = held.tokens ?? 0
+  const isColdAndLarge = view !== null && view.phase === 'cold' && tokens >= WORTH_ACTING_TOKENS
+
   return {
     view,
     meters: held.meters.map(meter => meterViewOf(meter, now)),
     busy: await read($, busy),
     canWarm: view !== null && view.phase === 'soon',
-    canCompact: held.tokens !== null && held.tokens > COMPACT_MIN_TOKENS,
+    canCompact: tokens > COMPACT_MIN_TOKENS || isColdAndLarge,
   }
 }
 
