@@ -1,0 +1,30 @@
+{
+  "name": "cache-countdown",
+  "displayName": "Cache Countdown",
+  "version": "0.1.0",
+  "description": "A fuse above the prompt that burns down with the prompt cache, with context and rate limit meters and buttons to keep the cache warm or compact",
+  "author": {
+    "name": "Omid Sayfun",
+    "url": "https://github.com/iamomiid"
+  },
+  "homepage": "https://github.com/iamomiid/cache-countdown#readme",
+  "repository": "https://github.com/iamomiid/cache-countdown",
+  "license": "MIT",
+  "keywords": ["mod", "prompt-cache", "countdown", "context", "rate-limits"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "ttl": {
+      "type": "string",
+      "title": "Cache lifetime",
+      "description": "Which lifetime to count down. auto reads the lifetime the session's requests were written with from the transcript.",
+      "options": ["auto", "5m", "1h"],
+      "default": "auto"
+    },
+    "toast": {
+      "type": "boolean",
+      "title": "Expiry toasts",
+      "description": "Show a toast shortly before the cache goes cold and when it does.",
+      "default": true
+    }
+  }
+}

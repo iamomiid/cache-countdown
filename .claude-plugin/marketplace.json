@@ -1,0 +1,17 @@
+{
+  "name": "cache-countdown",
+  "owner": {
+    "name": "Omid Sayfun",
+    "url": "https://github.com/iamomiid"
+  },
+  "description": "Cache Countdown: a fuse above the Claude Code prompt that burns down with the prompt cache",
+  "plugins": [
+    {
+      "name": "cache-countdown",
+      "source": ".",
+      "description": "A fuse above the prompt that burns down with the prompt cache, with context and rate limit meters and buttons to keep the cache warm or compact",
+      "category": "productivity",
+      "tags": ["mod", "prompt-cache", "countdown", "context", "rate-limits"]
+    }
+  ]
+}
