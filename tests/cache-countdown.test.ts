@@ -347,17 +347,17 @@ test('Keep warm leaves the countdown alone when the request misses the cache', {
 })
 
 test('Compact appears past 200k tokens of context and compacts', async ($, on) => {
-  mock.clock(on, { now: START })
+  const clock = mock.clock(on, { now: START })
   answerBand(on)
   let compactions = 0
   on('session.measure', (_$, e) => ({ changed: e.changed }))
   on('session.usage', () => ({
     value: { startedAt: START, context: { tokens: 30_000, window: 1_000_000, percent: 3 }, rateLimits: [] },
   }))
-  on('session.compact', () => {
+  on('command.run', { command: 'compact' }, () => {
     compactions += 1
 
-    return { messages: [] }
+    return { text: '' }
   })
   await $.session.measure({
     context: { tokens: 150_000, window: 1_000_000, percent: 15 },
@@ -383,6 +383,7 @@ test('Compact appears past 200k tokens of context and compacts', async ($, on) =
 
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   await ui.press({ key: 'compact' })
+  await clock.advance(1)
   expect(compactions).toBe(1)
   expect(await ui.find({ type: 'Text', text: /^ctx 30k$/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: 'compact' })).toBeUndefined()

@@ -84,6 +84,7 @@ const EXPIRY_TOAST_WINDOW_MS = 10_000
 const REBUILD_MIN_TOKENS = 10_000
 const WORTH_ACTING_TOKENS = 20_000
 const COMPACT_MIN_TOKENS = 200_000
+const REFUSAL_MARKER = '$.command.run: '
 const KEEP_WARM_PROMPT = 'Reply with the single word: ok'
 const NO_GAUGES: Gauges = { tokens: null, meters: [] }
 
@@ -422,21 +423,27 @@ async function keepWarm($: EngineInterface): Promise<void> {
   }
 }
 
+function refusalOf(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error)
+  const at = text.lastIndexOf(REFUSAL_MARKER)
+
+  return at === -1 ? text : text.slice(at + REFUSAL_MARKER.length)
+}
+
 async function compactNow($: EngineInterface): Promise<void> {
   if ((await read($, busy)) !== null) {
     return
   }
 
   await update($, busy, () => 'compacting')
+  $.clock.after(0, () => runCompact($))
+}
 
+async function runCompact($: EngineInterface): Promise<void> {
   try {
-    const outcome = await $.session.compact().catch(() => null)
-
-    if (outcome === null) {
-      $.ui.toast('Cannot compact while a turn is running.')
-    } else if ('skip' in outcome) {
-      $.ui.toast(`Compaction skipped: ${outcome.skip}`)
-    }
+    await $.command.run({ command: 'compact' })
+  } catch (error) {
+    $.ui.toast(`Could not compact: ${refusalOf(error)}`)
   } finally {
     await update($, busy, () => null)
     await remeasure($)
