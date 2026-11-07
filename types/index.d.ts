@@ -31,6 +31,7 @@ declare module 'claude-code' {
       transcript: string | null
       gauges: Gauges
       busy: Busy | null
+      away: number | null
     }
   }
 }
