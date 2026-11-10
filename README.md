@@ -73,9 +73,9 @@ If another mod draws above the prompt too, its row stays, under this one.
 
 For when you will be gone longer than the cache lasts. Tell the mod to keep the session warm and it presses Keep warm for you, about 3 minutes before each lapse of the 1 hour cache.
 
-- `/cache-countdown away` keeps it warm for 3 hours. Give a length with `/cache-countdown away 90m` or `away 1h30m`; the most is 12 hours. `/cache-countdown away off` ends it.
+- `/cache-countdown away` keeps it warm for 3 hours. Give a length with `/cache-countdown away 90m` or `away 1h30m`; the most is 24 hours. `/cache-countdown away always` keeps it on: every message you send restarts the 24 hour window, so it only lapses after a full day with no messages. `/cache-countdown away off` ends it.
 - The **Away 3h** button does the same, and **I'm back** ends it. While it runs, the row shows `away` and the time left.
-- It ends by itself when the time is up, when the cache has gone cold, or when a keep-warm request misses the cache or fails, so it never pays to rewrite the context over and over.
+- It ends by itself when weekly usage reaches 85%, when the time is up, when the cache has gone cold, or when a keep-warm request misses the cache or fails, so it never pays to rewrite the context over and over.
 - It runs only on the 1 hour lifetime. On a 5 minute cache it would need a request every few minutes, so it will not start.
 - Each request is real usage, the same as pressing Keep warm. It runs only while the session is open: if the machine sleeps or Claude Code exits, nothing is sent.
 

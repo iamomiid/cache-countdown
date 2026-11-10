@@ -95,7 +95,8 @@ const COMPACT_MIN_TOKENS = 200_000
 const REFUSAL_MARKER = '$.command.run: '
 const KEEP_WARM_PROMPT = 'Reply with the single word: ok'
 const AWAY_DEFAULT_MS = 3 * 60 * 60_000
-const AWAY_MAX_MS = 12 * 60 * 60_000
+const AWAY_MAX_MS = 24 * 60 * 60_000
+const AWAY_WEEKLY_STOP_PERCENT = 85
 const AWAY_LEAD_MS = 3 * 60_000
 const NO_GAUGES: Gauges = { tokens: null, meters: [] }
 
@@ -105,6 +106,7 @@ const transcript = atom({ plugin: 'cache-countdown', key: 'transcript' } as cons
 const gauges = atom({ plugin: 'cache-countdown', key: 'gauges' } as const, NO_GAUGES)
 const busy = atom({ plugin: 'cache-countdown', key: 'busy' } as const, null)
 const away = atom({ plugin: 'cache-countdown', key: 'away' } as const, null)
+const sticky = atom({ plugin: 'cache-countdown', key: 'sticky' } as const, false)
 
 let drawn = ''
 let flying = 0
@@ -496,6 +498,10 @@ async function arm(
 }
 
 async function disarm($: EngineInterface): Promise<void> {
+  if (await read($, sticky)) {
+    await update($, sticky, () => false)
+  }
+
   if ((await read($, away)) !== null) {
     await update($, away, () => null)
   }
@@ -527,6 +533,19 @@ async function autoWarm($: EngineInterface, view: View): Promise<void> {
   }
 
   if (!view.isKnown || view.tier !== '1h' || view.leftMs > AWAY_LEAD_MS) {
+    return
+  }
+
+  await remeasure($)
+  const weekly = (await read($, gauges)).meters.find(meter => meter.label === 'wk')
+
+  if (weekly !== undefined && weekly.percent >= AWAY_WEEKLY_STOP_PERCENT) {
+    await disarm($)
+    $.ui.toast(
+      `Away mode stopped: weekly usage is at ${Math.round(weekly.percent)}% (stops at ${AWAY_WEEKLY_STOP_PERCENT}%).`,
+      { timeoutMs: 12_000 },
+    )
+
     return
   }
 
@@ -807,6 +826,11 @@ export const register: Register = (on, options) => {
   on('classic.UserPromptSubmit', async ($, e, next) => {
     await remember($, e.transcript_path)
 
+    if (await read($, sticky)) {
+      const now = await $.clock.now()
+      await update($, away, () => now + AWAY_MAX_MS)
+    }
+
     return next(e)
   })
 
@@ -886,10 +910,24 @@ export const register: Register = (on, options) => {
         return { text: 'Away mode off.' }
       }
 
+      if (text === 'always' || text === 'on') {
+        const armed = await arm($, AWAY_MAX_MS, forced)
+
+        if ((await read($, away)) !== null) {
+          await update($, sticky, () => true)
+
+          return {
+            text: `${armed}\nAlways on: every message you send restarts the ${spanOf(AWAY_MAX_MS)} window. Turn off with /cache-countdown away off.`,
+          }
+        }
+
+        return { text: armed }
+      }
+
       const ms = text === '' ? AWAY_DEFAULT_MS : durationOf(text)
 
       if (ms === null) {
-        return { text: 'Usage: /cache-countdown away [3h | 90m | 1h30m | off]' }
+        return { text: 'Usage: /cache-countdown away [3h | 90m | 1h30m | always | off]' }
       }
 
       return { text: await arm($, ms, forced) }
@@ -919,7 +957,8 @@ export const register: Register = (on, options) => {
     ]
 
     const awayMs = await awayLeft($)
-    const watch = awayMs === null || awayMs <= 0 ? [] : [`Away mode: keeping it warm for ${spanOf(awayMs)} more.`]
+    const always = (await read($, sticky)) ? ' (always on: renews with each message)' : ''
+    const watch = awayMs === null || awayMs <= 0 ? [] : [`Away mode: keeping it warm for ${spanOf(awayMs)} more${always}.`]
 
     return { text: [...lines, ...watch, ...share, ...reported].join('\n') }
   })

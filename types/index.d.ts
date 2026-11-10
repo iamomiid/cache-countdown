@@ -32,6 +32,7 @@ declare module 'claude-code' {
       gauges: Gauges
       busy: Busy | null
       away: number | null
+      sticky: boolean
     }
   }
 }
