@@ -35,7 +35,7 @@ claude --plugin-dir ./cache-countdown
 
 The band appears after the first reply of a conversation.
 
-A mod runs with your permissions. To see what this one hooks and calls before loading it, run `claude plugin validate` on the cloned folder. It reads the session transcript, runs `tail` on it, and makes a model request only when you press Keep warm.
+A mod runs with your permissions. To see what this one hooks and calls before loading it, run `claude plugin validate` on the cloned folder. It reads the session transcript, runs `tail` on it, and makes a model request only when you press Keep warm or turn on away mode.
 
 ## What it shows
 
@@ -68,6 +68,16 @@ If another mod draws above the prompt too, its row stays, under this one.
 
 - **Keep warm** appears while the cache is about to lapse. It asks the model one short question over the conversation as it was last sent, which reads the cache and restarts its lifetime. That request is real usage: the whole context at the cache-read price. A toast says how many tokens were read. If the request wrote the context again instead of reading it, the toast says so and the countdown stays as it was.
 - **Compact** appears beside the context meter once the conversation holds more than 200k tokens, and whenever the cache is cold and the conversation holds 20k tokens or more. It runs `/compact`, as if you had typed it, with no confirmation step. Pressed while a turn is running, it waits for the turn to end. Compacting a cold conversation still reads the whole context once, as any next message would; what it saves is carrying that context into every message after.
+
+## Away mode
+
+For when you will be gone longer than the cache lasts. Tell the mod to keep the session warm and it presses Keep warm for you, about 3 minutes before each lapse of the 1 hour cache.
+
+- `/cache-countdown away` keeps it warm for 3 hours. Give a length with `/cache-countdown away 90m` or `away 1h30m`; the most is 24 hours. `/cache-countdown away always` keeps it on: every message you send restarts the 24 hour window, so it only lapses after a full day with no messages. `/cache-countdown away off` ends it.
+- The **Away 3h** button does the same, and **I'm back** ends it. While it runs, the row shows `away` and the time left.
+- It ends by itself when weekly usage reaches 85%, when the time is up, when the cache has gone cold, or when a keep-warm request misses the cache or fails, so it never pays to rewrite the context over and over.
+- It runs only on the 1 hour lifetime. On a 5 minute cache it would need a request every few minutes, so it will not start.
+- Each request is real usage, the same as pressing Keep warm. It runs only while the session is open: if the machine sleeps or Claude Code exits, nothing is sent.
 
 ## Options
 

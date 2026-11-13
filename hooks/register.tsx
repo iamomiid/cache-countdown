@@ -38,8 +38,16 @@ type Scene = {
   busy: Busy | null
   canWarm: boolean
   canCompact: boolean
+  awayMs: number | null
+  canAway: boolean
 }
-type Actions = { onWarm: () => unknown; onCompact: () => unknown }
+type Actions = {
+  onWarm: () => unknown
+  onCompact: () => unknown
+  onAway: () => unknown
+  onBack: () => unknown
+}
+type WarmOutcome = 'kept' | 'missed' | 'empty' | 'skipped'
 
 type TranscriptRow = {
   type?: string
@@ -86,6 +94,10 @@ const WORTH_ACTING_TOKENS = 20_000
 const COMPACT_MIN_TOKENS = 200_000
 const REFUSAL_MARKER = '$.command.run: '
 const KEEP_WARM_PROMPT = 'Reply with the single word: ok'
+const AWAY_DEFAULT_MS = 3 * 60 * 60_000
+const AWAY_MAX_MS = 24 * 60 * 60_000
+const AWAY_WEEKLY_STOP_PERCENT = 85
+const AWAY_LEAD_MS = 3 * 60_000
 const NO_GAUGES: Gauges = { tokens: null, meters: [] }
 
 const touch = atom({ plugin: 'cache-countdown', key: 'touch' } as const, null)
@@ -93,10 +105,13 @@ const tiers = atom({ plugin: 'cache-countdown', key: 'tiers' } as const, [])
 const transcript = atom({ plugin: 'cache-countdown', key: 'transcript' } as const, null)
 const gauges = atom({ plugin: 'cache-countdown', key: 'gauges' } as const, NO_GAUGES)
 const busy = atom({ plugin: 'cache-countdown', key: 'busy' } as const, null)
+const away = atom({ plugin: 'cache-countdown', key: 'away' } as const, null)
+const sticky = atom({ plugin: 'cache-countdown', key: 'sticky' } as const, false)
 
 let drawn = ''
 let flying = 0
 let toastedAt = 0
+let isAutoWarming = false
 const toasted = new Set<string>()
 
 function clockOf(ms: number): string {
@@ -132,6 +147,28 @@ function resetsOf(resetsAt: string | null, now: number): string | null {
   }
 
   return hours >= 1 ? `${hours}h${minutes % 60}m` : `${minutes}m`
+}
+
+function spanOf(ms: number): string {
+  const minutes = Math.max(1, Math.ceil(ms / 60_000))
+  const hours = Math.floor(minutes / 60)
+
+  return hours >= 1 ? `${hours}h${minutes % 60}m` : `${minutes}m`
+}
+
+function durationOf(text: string): number | null {
+  const match = /^(?:(\d+(?:\.\d+)?)h)?(?:(\d+)m)?$|^(\d+(?:\.\d+)?)$/.exec(text.trim())
+
+  if (match === null || text.trim() === '') {
+    return null
+  }
+
+  const ms =
+    match[3] === undefined
+      ? Number(match[1] ?? 0) * 3_600_000 + Number(match[2] ?? 0) * 60_000
+      : Number(match[3]) * 3_600_000
+
+  return ms > 0 ? ms : null
 }
 
 function tint(color: string | null): { color?: string } {
@@ -375,11 +412,11 @@ async function note(
   }
 }
 
-async function keepWarm($: EngineInterface): Promise<void> {
+async function keepWarm($: EngineInterface): Promise<WarmOutcome> {
   const last = await read($, touch)
 
   if (last === null || (await read($, busy)) !== null) {
-    return
+    return 'skipped'
   }
 
   await update($, busy, () => 'warming')
@@ -391,7 +428,7 @@ async function keepWarm($: EngineInterface): Promise<void> {
     if (!reply.isAnswered && reply.reason === 'nothing-to-fork') {
       $.ui.toast('Nothing to keep warm yet.')
 
-      return
+      return 'empty'
     }
 
     const served = reply.usage.cache_read_input_tokens
@@ -409,7 +446,7 @@ async function keepWarm($: EngineInterface): Promise<void> {
       await update($, touch, () => next)
       $.ui.toast(`Cache kept warm: ${compactOf(served)} tokens read from it.`)
 
-      return
+      return 'kept'
     }
 
     $.ui.toast(
@@ -418,8 +455,116 @@ async function keepWarm($: EngineInterface): Promise<void> {
         : `Keep warm missed the cache: ${compactOf(written)} tokens were written again. The countdown is unchanged.`,
       { timeoutMs: 12_000 },
     )
+
+    return 'missed'
   } finally {
     await update($, busy, () => null)
+  }
+}
+
+async function awayLeft($: EngineInterface): Promise<number | null> {
+  const until = await read($, away)
+
+  return until === null ? null : until - (await $.clock.now())
+}
+
+async function arm(
+  $: EngineInterface,
+  ms: number,
+  forced: CacheTier | null,
+): Promise<string> {
+  const last = await read($, touch)
+  const now = await $.clock.now()
+
+  if (last === null) {
+    return 'No cached request seen yet, so there is nothing to keep warm. Try again after the first reply.'
+  }
+
+  const held = await read($, gauges)
+  const view = viewOf(last, forced, await read($, tiers), held.tokens, now)
+
+  if (view.phase === 'cold') {
+    return 'The cache is already cold. Send a message first, then set the session away.'
+  }
+
+  if (view.isKnown && view.tier === '5m') {
+    return 'This session caches for 5 minutes, so keeping it warm would mean a request every few minutes. Away mode only runs on the 1 hour lifetime.'
+  }
+
+  const span = Math.min(ms, AWAY_MAX_MS)
+  await update($, away, () => now + span)
+
+  return `Keeping the cache warm for ${spanOf(span)}. It sends one short request about ${spanOf(AWAY_LEAD_MS)} before each lapse, and stops early if a request misses the cache.`
+}
+
+async function disarm($: EngineInterface): Promise<void> {
+  if (await read($, sticky)) {
+    await update($, sticky, () => false)
+  }
+
+  if ((await read($, away)) !== null) {
+    await update($, away, () => null)
+  }
+}
+
+async function autoWarm($: EngineInterface, view: View): Promise<void> {
+  const left = await awayLeft($)
+
+  if (left === null || isAutoWarming) {
+    return
+  }
+
+  if (left <= 0) {
+    await disarm($)
+    $.ui.toast(
+      view.phase === 'cold'
+        ? 'Away mode ended. The cache is cold.'
+        : `Away mode ended. The cache lapses in ${clockOf(view.leftMs)}.`,
+    )
+
+    return
+  }
+
+  if (view.phase === 'cold') {
+    await disarm($)
+    $.ui.toast('Away mode stopped: the cache went cold.', { timeoutMs: 12_000 })
+
+    return
+  }
+
+  if (!view.isKnown || view.tier !== '1h' || view.leftMs > AWAY_LEAD_MS) {
+    return
+  }
+
+  await remeasure($)
+  const weekly = (await read($, gauges)).meters.find(meter => meter.label === 'wk')
+
+  if (weekly !== undefined && weekly.percent >= AWAY_WEEKLY_STOP_PERCENT) {
+    await disarm($)
+    $.ui.toast(
+      `Away mode stopped: weekly usage is at ${Math.round(weekly.percent)}% (stops at ${AWAY_WEEKLY_STOP_PERCENT}%).`,
+      { timeoutMs: 12_000 },
+    )
+
+    return
+  }
+
+  isAutoWarming = true
+
+  try {
+    const outcome = await keepWarm($)
+
+    if (outcome === 'missed' || outcome === 'empty') {
+      await disarm($)
+      $.ui.toast('Away mode stopped: a keep-warm request did not read the cache.', {
+        timeoutMs: 12_000,
+      })
+    }
+  } catch (error) {
+    await disarm($)
+    $.ui.toast(`Away mode stopped: ${refusalOf(error)}`, { timeoutMs: 12_000 })
+  } finally {
+    isAutoWarming = false
   }
 }
 
@@ -493,11 +638,17 @@ async function tick(
   }
 
   const view = viewOf(last, forced, await read($, tiers), held.tokens, now)
-  const label = [view.time, view.life, view.note, Math.round(view.fraction * FUSE_PX), meters].join()
+  const awayMs = await awayLeft($)
+  const awayLabel = awayMs === null ? '' : spanOf(awayMs)
+  const label = [view.time, view.life, view.note, Math.round(view.fraction * FUSE_PX), meters, awayLabel].join()
 
   if (label !== drawn) {
     drawn = label
     $.ui.invalidate('ui.render')
+  }
+
+  if (awayMs !== null && flying === 0) {
+    await autoWarm($, view)
   }
 
   const isWorthIt = held.tokens === null || held.tokens >= WORTH_ACTING_TOKENS
@@ -521,12 +672,17 @@ async function sceneOf($: EngineInterface, forced: CacheTier | null): Promise<Sc
   const tokens = held.tokens ?? 0
   const isColdAndLarge = view !== null && view.phase === 'cold' && tokens >= WORTH_ACTING_TOKENS
 
+  const awayMs = await awayLeft($)
+  const isFiveMinute = view !== null && view.isKnown && view.tier === '5m'
+
   return {
     view,
     meters: held.meters.map(meter => meterViewOf(meter, now)),
     busy: await read($, busy),
     canWarm: view !== null && view.phase === 'soon',
     canCompact: tokens > COMPACT_MIN_TOKENS || isColdAndLarge,
+    awayMs: awayMs !== null && awayMs > 0 ? awayMs : null,
+    canAway: view !== null && view.phase !== 'cold' && !isFiveMinute,
   }
 }
 
@@ -554,6 +710,13 @@ function drawDesktop(table: Elements['desktop'], scene: Scene, actions: Actions)
           {scene.busy === 'warming' && <Text>warming</Text>}
           {scene.canWarm && scene.busy === null && (
             <Button key="warm" label="Keep warm" variant="primary" onPress={actions.onWarm} />
+          )}
+          {scene.awayMs !== null && <Text>{`away ${spanOf(scene.awayMs)}`}</Text>}
+          {scene.awayMs !== null && (
+            <Button key="back" label="I'm back" onPress={actions.onBack} />
+          )}
+          {scene.awayMs === null && scene.canAway && scene.busy === null && (
+            <Button key="away" label={`Away ${spanOf(AWAY_DEFAULT_MS)}`} onPress={actions.onAway} />
           )}
         </Box>
       )}
@@ -612,6 +775,13 @@ function drawTerminal(table: Elements['terminal'], scene: Scene, actions: Action
           {scene.canWarm && scene.busy === null && (
             <Button key="warm" label="Keep warm" variant="primary" onPress={actions.onWarm} />
           )}
+          {scene.awayMs !== null && <Text>{`away ${spanOf(scene.awayMs)}`}</Text>}
+          {scene.awayMs !== null && (
+            <Button key="back" label="I'm back" onPress={actions.onBack} />
+          )}
+          {scene.awayMs === null && scene.canAway && scene.busy === null && (
+            <Button key="away" label={`Away ${spanOf(AWAY_DEFAULT_MS)}`} onPress={actions.onAway} />
+          )}
         </Box>
       )}
       {meters.map((meter, index) => (
@@ -655,6 +825,11 @@ export const register: Register = (on, options) => {
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
     await remember($, e.transcript_path)
+
+    if (await read($, sticky)) {
+      const now = await $.clock.now()
+      await update($, away, () => now + AWAY_MAX_MS)
+    }
 
     return next(e)
   })
@@ -723,7 +898,41 @@ export const register: Register = (on, options) => {
     }
   })
 
-  on('command.run', { command: 'cache-countdown' }, async $ => {
+  on('command.run', { command: 'cache-countdown' }, async ($, e) => {
+    const [verb, ...rest] = String(e.args ?? '').trim().split(/\s+/)
+
+    if (verb === 'away') {
+      const text = rest.join('').toLowerCase()
+
+      if (text === 'off' || text === 'stop') {
+        await disarm($)
+
+        return { text: 'Away mode off.' }
+      }
+
+      if (text === 'always' || text === 'on') {
+        const armed = await arm($, AWAY_MAX_MS, forced)
+
+        if ((await read($, away)) !== null) {
+          await update($, sticky, () => true)
+
+          return {
+            text: `${armed}\nAlways on: every message you send restarts the ${spanOf(AWAY_MAX_MS)} window. Turn off with /cache-countdown away off.`,
+          }
+        }
+
+        return { text: armed }
+      }
+
+      const ms = text === '' ? AWAY_DEFAULT_MS : durationOf(text)
+
+      if (ms === null) {
+        return { text: 'Usage: /cache-countdown away [3h | 90m | 1h30m | always | off]' }
+      }
+
+      return { text: await arm($, ms, forced) }
+    }
+
     const last = await read($, touch)
     const held = await read($, gauges)
     const now = await $.clock.now()
@@ -747,7 +956,11 @@ export const register: Register = (on, options) => {
       `Prompt cache (${view.life}): ${state}${view.note === null ? '' : `, ${view.note}`}.`,
     ]
 
-    return { text: [...lines, ...share, ...reported].join('\n') }
+    const awayMs = await awayLeft($)
+    const always = (await read($, sticky)) ? ' (always on: renews with each message)' : ''
+    const watch = awayMs === null || awayMs <= 0 ? [] : [`Away mode: keeping it warm for ${spanOf(awayMs)} more${always}.`]
+
+    return { text: [...lines, ...watch, ...share, ...reported].join('\n') }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -760,6 +973,13 @@ export const register: Register = (on, options) => {
     const actions: Actions = {
       onWarm: () => keepWarm($),
       onCompact: () => compactNow($),
+      onAway: async () => {
+        $.ui.toast(await arm($, AWAY_DEFAULT_MS, forced))
+      },
+      onBack: async () => {
+        await disarm($)
+        $.ui.toast('Away mode off.')
+      },
     }
 
     if (e.surface === 'desktop') {

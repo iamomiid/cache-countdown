@@ -428,3 +428,84 @@ test('Compact also appears once the cache is cold', { options: { ttl: '5m' } }, 
     await cold.unmount()
   }
 })
+
+const HIT = {
+  isAnswered: true,
+  text: 'ok',
+  usage: {
+    input_tokens: 5,
+    output_tokens: 1,
+    cache_read_input_tokens: 212_000,
+    cache_creation_input_tokens: 0,
+  },
+}
+const MISS = {
+  ...HIT,
+  usage: { ...HIT.usage, cache_read_input_tokens: 0, cache_creation_input_tokens: 212_000 },
+}
+
+test('away mode keeps a 1h cache warm without a button press', { options: { ttl: '1h' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  answerBand(on)
+  answerSteps(on, CACHED)
+  answerStart(on)
+  let forks = 0
+  on('model.fork', () => {
+    forks += 1
+
+    return { value: HIT }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await step($)
+
+  const answer = await $.command.run({ ...ASK, args: 'away 2h' })
+  expect(answer.text).toContain('Keeping the cache warm for 2h0m')
+
+  await clock.advance(56 * 60_000)
+  expect(forks).toBe(0)
+  await clock.advance(2 * 60_000)
+  expect(forks).toBe(1)
+  await clock.advance(60 * 60_000)
+  expect(forks).toBe(2)
+
+  await clock.advance(60 * 60_000)
+  expect(forks).toBe(2)
+  expect((await $.command.run(ASK)).text).not.toContain('Away mode:')
+})
+
+test('away mode stops when a keep-warm request misses', { options: { ttl: '1h' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  answerBand(on)
+  answerSteps(on, CACHED)
+  answerStart(on)
+  let forks = 0
+  on('model.fork', () => {
+    forks += 1
+
+    return { value: MISS }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await step($)
+  await $.command.run({ ...ASK, args: 'away' })
+
+  await clock.advance(58 * 60_000)
+  await clock.advance(10 * 60_000)
+  expect(forks).toBe(1)
+})
+
+test('away buttons arm and disarm the mode', { options: { ttl: '1h' } }, async ($, on) => {
+  mock.clock(on, { now: START })
+  answerBand(on)
+  answerSteps(on, CACHED)
+  on('ui.toast', () => ({ value: undefined }))
+  await step($)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'away' })
+  expect(await ui.find({ type: 'Button', key: 'back' })).toBeDefined()
+  await ui.press({ key: 'back' })
+  expect(await ui.find({ type: 'Button', key: 'away' })).toBeDefined()
+  await ui.unmount()
+})
