@@ -46,7 +46,7 @@ One row above the prompt. In the Desktop app:
 In a terminal:
 
 ```text
-52m ━━━━━━━━━━━━━━━━━━━━━─── 1h   ctx 212k 21%  │  5h 28% 3h41m  │  wk 36% 4d16h
+52m ━━━━━━━━━━━━━━━━━━━━━─── 1h   ctx 212k 21%  │  5h 28% 3h41m  │  wk 36% ━━━┃━┄┄┄┄┄┄┄▏ out Sun 01:30 · 12h early
 ```
 
 Both images on this page are illustrations drawn to match the app, with example figures.
@@ -57,8 +57,9 @@ The row holds:
 - **The lifetime in play**, `5m` or `1h`.
 - **A note when something needs you**: `about to lapse` in the last five minutes (1h) or last minute (5m), `next message rewrites 212k tokens` once the cache is cold, and `last request rewrote 203k tokens` after a request that missed the cache.
 - **Meters**: context with the tokens in use and the share of the window, then each rate limit window the account reports (`5h`, `wk`, and any other) with the share used and the time until it resets.
+- **The week's pace**: the weekly meter is a longer bar with a tick for even pace, where you'd be if the week were spread evenly, and a dashed tail to where you'll end at the rate you've used it so far. When that runs past 100%, the bar ends in a red cap and the meter names the time you'll run out: `out Sun 01:30 · 12h early`. Otherwise it says `on pace`. It waits until 12 hours into the week, since an early rate says little. A per-model weekly limit, such as `fable`, shows only while it's ahead of its pace.
 
-Nothing is colored while all is well. The time and fuse take the warning color when the cache is about to lapse and the error color when it is cold. A meter takes the warning color at 70% and the error color at 90%.
+Nothing is colored while all is well. The time and fuse take the warning color when the cache is about to lapse and the error color when it is cold. A meter takes the warning color at 70% and the error color at 90%. The weekly meter also takes the warning color while it's ahead of pace.
 
 It also shows a toast shortly before the cache lapses and when it does, for conversations of 20k tokens or more. `/cache-countdown` prints the figures as text, for surfaces that draw no band (VS Code, `claude -p`).
 
@@ -106,6 +107,7 @@ Set them with `/plugin configure cache-countdown@cache-countdown`, or in the `/c
 - The transcript's tail is read with `tail`. Where `tail` is missing, as on Windows, the whole file is read, which works up to 4 MiB. Past that, the lifetime stays unconfirmed unless `ttl` is set.
 - A model switch clears the countdown, since the cache is per model.
 - Context and rate limit figures are the ones Claude Code reports after each turn.
+- The week starts seven days before its reset time. The pace projection is the week's average rate so far, so a heavy morning moves it more early in the week than late.
 - On `/resume` and `/branch` the countdown starts from the resumed conversation's last response.
 
 ## Limits

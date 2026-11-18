@@ -20,6 +20,14 @@ type MeterView = {
   level: Level
   trail: string | null
   isContext: boolean
+  pace: Pace | null
+  isHidden: boolean
+}
+type Pace = {
+  par: number
+  projected: number | null
+  isAhead: boolean
+  news: string | null
 }
 type View = {
   tier: CacheTier
@@ -110,6 +118,11 @@ const COMPACT_MIN_TOKENS = 200_000
 const REFUSAL_MARKER = '$.command.run: '
 const KEEP_WARM_PROMPT = 'Reply with the single word: ok'
 const NO_GAUGES: Gauges = { tokens: null, meters: [] }
+const WEEK_MS = 7 * 24 * 60 * 60_000
+const PACE_SETTLE_MS = 12 * 60 * 60_000
+const WEEK_PX = 90
+const WEEK_CELLS = 12
+const MAIN_WEEK = 'wk'
 const HOUR_MS = 60 * 60_000
 const HOLD_MIN_MS = 60_000
 const HOLD_MAX_MS = 24 * HOUR_MS
@@ -314,16 +327,57 @@ function viewOf(
   }
 }
 
+function earlyOf(ms: number): string {
+  const hours = Math.round(ms / HOUR_MS)
+
+  if (hours < 1) {
+    return `${Math.max(1, Math.round(ms / 60_000))}m`
+  }
+
+  return hours < 48 ? `${hours}h` : `${Math.round(hours / 24)}d`
+}
+
+function paceOf(meter: Meter, now: number): Pace | null {
+  const end = meter.isWeekly === true && meter.resetsAt !== null ? Date.parse(meter.resetsAt) : Number.NaN
+  const start = end - WEEK_MS
+  const elapsed = now - start
+
+  if (Number.isNaN(end) || elapsed <= 0 || elapsed > WEEK_MS) {
+    return null
+  }
+
+  const par = (elapsed / WEEK_MS) * 100
+
+  if (elapsed < PACE_SETTLE_MS || meter.percent <= 0) {
+    return { par, projected: null, isAhead: false, news: null }
+  }
+
+  const projected = (meter.percent / elapsed) * WEEK_MS
+  const runsOutAt = start + (100 / meter.percent) * elapsed
+
+  if (meter.percent >= 100) {
+    return { par, projected, isAhead: true, news: `out until ${timeOf(end, now)}` }
+  }
+
+  return projected > 100
+    ? { par, projected, isAhead: true, news: `out ${timeOf(runsOutAt, now)} · ${earlyOf(end - runsOutAt)} early` }
+    : { par, projected, isAhead: false, news: 'on pace' }
+}
+
 function meterViewOf(meter: Meter, now: number): MeterView {
-  const level: Level = meter.percent >= 90 ? 'full' : meter.percent >= 70 ? 'warn' : 'calm'
+  const pace = paceOf(meter, now)
+  const byShare: Level = meter.percent >= 90 ? 'full' : meter.percent >= 70 ? 'warn' : 'calm'
+  const level: Level = byShare === 'calm' && pace?.isAhead === true ? 'warn' : byShare
 
   return {
     label: meter.label,
     lead: meter.tokens === null ? null : compactOf(meter.tokens),
     percent: Math.round(meter.percent),
     level,
-    trail: resetsOf(meter.resetsAt, now),
+    trail: pace?.news ?? resetsOf(meter.resetsAt, now),
     isContext: meter.tokens !== null,
+    pace,
+    isHidden: meter.label !== MAIN_WEEK && pace !== null && pace.projected !== null && !pace.isAhead,
   }
 }
 
@@ -337,6 +391,7 @@ function gaugesOf(context: SessionContextUsage, limits: readonly SessionRateLimi
     percent: limit.percentUsed,
     tokens: null,
     resetsAt: limit.resetsAt ?? null,
+    isWeekly: limit.kind.startsWith('seven_day'),
   }))
 
   return { tokens: context.tokens ?? null, meters: [...fill, ...windows] }
@@ -370,6 +425,41 @@ function fuseSvg(view: View): string {
   const track = view.phase === 'cold' ? SVG_FILL.cold : SVG_CALM
 
   return barSvg(FUSE_PX, SEGMENTS[view.tier], view.fraction, SVG_FILL[view.phase], track)
+}
+
+function weekSvg(meter: MeterView, pace: Pace): string {
+  const width = WEEK_PX
+  const y = (BAR_HEIGHT_PX - 4) / 2
+  const at = (percent: number) => (Math.max(0, Math.min(100, percent)) / 100) * width
+  const used = at(meter.percent)
+  const fill = SVG_LEVEL[meter.level]
+  const parts = [
+    `<rect x="0" y="${y}" width="${width}" height="4" rx="2" fill="${SVG_CALM}" fill-opacity="0.32"/>`,
+    `<rect x="0" y="${y}" width="${used.toFixed(2)}" height="4" rx="2" fill="${fill}"/>`,
+  ]
+
+  if (pace.projected !== null && pace.projected > meter.percent) {
+    const reach = at(pace.projected)
+    parts.push(
+      `<line x1="${(used + 2).toFixed(2)}" y1="${BAR_HEIGHT_PX / 2}" x2="${reach.toFixed(2)}" y2="${BAR_HEIGHT_PX / 2}" stroke="${fill}" stroke-width="2" stroke-dasharray="3 2" stroke-opacity="0.8"/>`,
+    )
+
+    if (pace.projected > 100) {
+      parts.push(`<rect x="${width - 2}" y="1" width="2" height="${BAR_HEIGHT_PX - 2}" rx="1" fill="${SVG_LEVEL.full}"/>`)
+    }
+  }
+
+  parts.push(`<rect x="${(at(pace.par) - 1).toFixed(2)}" y="0" width="2" height="${BAR_HEIGHT_PX}" rx="1" fill="#e8e6e1"/>`)
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${BAR_HEIGHT_PX}" viewBox="0 0 ${width} ${BAR_HEIGHT_PX}">${parts.join('')}</svg>`
+}
+
+function weekCells(meter: MeterView, pace: Pace): { used: number; par: number; tail: number } {
+  const cell = (percent: number) => Math.round((Math.max(0, Math.min(100, percent)) / 100) * WEEK_CELLS)
+  const used = cell(meter.percent)
+  const tail = pace.projected === null ? used : Math.max(used, cell(pace.projected))
+
+  return { used, par: Math.min(WEEK_CELLS - 1, cell(pace.par)), tail }
 }
 
 function meterSvg(meter: MeterView): string {
@@ -860,7 +950,7 @@ async function sceneOf($: EngineInterface, forced: CacheTier | null): Promise<Sc
 
   return {
     view,
-    meters: held.meters.map(meter => meterViewOf(meter, now)),
+    meters: held.meters.map(meter => meterViewOf(meter, now)).filter(meter => !meter.isHidden),
     busy: await read($, busy),
     canWarm: view !== null && view.phase === 'soon' && view.tier === '5m' && current === null,
     canCompact: (tokens > COMPACT_MIN_TOKENS || isColdAndLarge) && offerMode === null,
@@ -1019,14 +1109,25 @@ function drawDesktop(table: Elements['desktop'], scene: Scene, actions: Actions)
               />
             )}
             <Text>{meter.lead === null ? meter.label : `${meter.label} ${meter.lead}`}</Text>
-            <Svg
-              source={meterSvg(meter)}
-              alt={`${meter.percent}% used`}
-              width={METER_PX}
-              height={BAR_HEIGHT_PX}
-            />
+            {meter.pace === null ? (
+              <Svg
+                source={meterSvg(meter)}
+                alt={`${meter.percent}% used`}
+                width={METER_PX}
+                height={BAR_HEIGHT_PX}
+              />
+            ) : (
+              <Svg
+                source={weekSvg(meter, meter.pace)}
+                alt={paceAlt(meter, meter.pace)}
+                width={WEEK_PX}
+                height={BAR_HEIGHT_PX}
+              />
+            )}
             <Text {...tint(LEVEL_COLOR[meter.level])}>{meter.percent}%</Text>
-            {meter.trail !== null && <Text>{meter.trail}</Text>}
+            {meter.trail !== null && (
+              <Text {...tint(meter.pace?.isAhead === true ? 'warning' : null)}>{meter.trail}</Text>
+            )}
             {meter.isContext && scene.busy === 'compacting' && <Text>compacting</Text>}
             {meter.isContext && scene.canCompact && scene.busy === null && (
               <Button key="compact" label="Compact" onPress={actions.onCompact} />
@@ -1043,6 +1144,43 @@ function drawDesktop(table: Elements['desktop'], scene: Scene, actions: Actions)
     <Box flexDirection="column" rowGap={1}>
       {row}
       {offered}
+    </Box>
+  )
+}
+
+function paceAlt(meter: MeterView, pace: Pace): string {
+  const even = `even pace ${Math.round(pace.par)}%`
+
+  return pace.projected === null
+    ? `${meter.percent}% of the week used, ${even}`
+    : `${meter.percent}% of the week used, ${even}, heading for ${Math.round(pace.projected)}%`
+}
+
+function weekTerminal(table: Elements['terminal'], meter: MeterView, pace: Pace): RenderElement {
+  const { Box, Text } = table
+  const cells = weekCells(meter, pace)
+  const bar: RenderElement[] = []
+
+  for (let i = 0; i < WEEK_CELLS; i += 1) {
+    if (i === cells.par) {
+      bar.push(<Text bold>┃</Text>)
+    } else if (i < cells.used) {
+      bar.push(<Text {...tint(LEVEL_COLOR[meter.level])}>━</Text>)
+    } else if (i < cells.tail) {
+      bar.push(<Text {...tint(pace.isAhead ? 'warning' : null)}>┄</Text>)
+    } else {
+      bar.push(<Text>─</Text>)
+    }
+  }
+
+  return (
+    <Box columnGap={1}>
+      <Text {...tint(LEVEL_COLOR[meter.level])}>{`${meter.label} ${meter.percent}%`}</Text>
+      <Box>
+        {bar}
+        {pace.projected !== null && pace.projected > 100 && <Text color="error">▏</Text>}
+      </Box>
+      {meter.trail !== null && <Text {...tint(pace.isAhead ? 'warning' : null)}>{meter.trail}</Text>}
     </Box>
   )
 }
@@ -1093,7 +1231,11 @@ function drawTerminal(table: Elements['terminal'], scene: Scene, actions: Action
       {meters.map((meter, index) => (
         <Box columnGap={2}>
           {index > 0 && <Text>│</Text>}
-          <Text {...tint(LEVEL_COLOR[meter.level])}>{meterText(meter)}</Text>
+          {meter.pace === null ? (
+            <Text {...tint(LEVEL_COLOR[meter.level])}>{meterText(meter)}</Text>
+          ) : (
+            weekTerminal(table, meter, meter.pace)
+          )}
           {meter.isContext && scene.busy === 'compacting' && <Text>compacting</Text>}
           {meter.isContext && scene.canCompact && scene.busy === null && (
             <Button key="compact" label="Compact" onPress={actions.onCompact} />

@@ -220,7 +220,9 @@ test('shows context and rate limit meters', { options: { ttl: '1h' } }, async ($
   const idle = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await idle.find({ type: 'Text', text: /^ctx 212k 21%$/ })).toBeDefined()
   expect((await idle.find({ type: 'Text', text: /^5h 92% 1h12m$/ }))?.props.color).toBe('error')
-  expect((await idle.find({ type: 'Text', text: /^wk 71% 4d4h$/ }))?.props.color).toBe('warning')
+  expect((await idle.find({ type: 'Text', text: /^wk 71%$/ }))?.props.color).toBe('warning')
+  expect((await idle.find({ type: 'Text', text: /^out .+ · \d+[mhd] early$/ }))?.props.color).toBe('warning')
+  expect(await idle.find({ type: 'Text', text: /^┃$/ })).toBeDefined()
   expect(await idle.find({ type: 'Text', text: /^fable 12%$/ })).toBeDefined()
   expect(await idle.findAll({ type: 'Text', text: /^│$/ })).toHaveLength(3)
   await idle.unmount()
@@ -484,7 +486,7 @@ test('the hold row appears five minutes before a 1h cache goes cold', { options:
   }
 })
 
-test('a chip keeps the cache warm until that time, then ends', { options: { ttl: '1h' } }, async ($, on) => {
+test('a chip keeps the cache warm until that time, then ends', { options: { ttl: '1h' }, timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: START })
   const counter = { forks: 0 }
   answerBand(on)
@@ -644,4 +646,49 @@ test('Let it go cold hides the row, Other… takes a typed time', { options: { t
   expect(await again.find({ type: 'Text', text: /^warm until / })).toBeDefined()
   expect(await again.find({ type: 'Input', key: 'back' })).toBeUndefined()
   await again.unmount()
+})
+
+test('the week meter shows even pace and where the week ends at this rate', async ($, on) => {
+  mock.clock(on, { now: START })
+  answerBand(on)
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  const week = (percentUsed: number, hoursLeft: number, fable?: number) =>
+    $.session.measure({
+      context: { tokens: 50_000, window: 1_000_000, percent: 5 },
+      rateLimits: [
+        { kind: 'seven_day', percentUsed, resetsAt: new Date(START + hoursLeft * HOUR).toISOString() },
+        ...(fable === undefined
+          ? []
+          : [{ kind: 'seven_day_fable', percentUsed: fable, resetsAt: new Date(START + hoursLeft * HOUR).toISOString() }]),
+      ],
+      changed: ['rateLimits'],
+    })
+
+  await week(30, 112, 30)
+  const calm = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await calm.find({ type: 'Text', text: /^on pace$/ }))?.props.color).toBeUndefined()
+  expect((await calm.findAll({ type: 'Svg' })).map(svg => svg.props.alt)).toContain(
+    '30% of the week used, even pace 33%, heading for 90%',
+  )
+  expect(await calm.find({ type: 'Text', text: /^fable$/ })).toBeUndefined()
+  await calm.unmount()
+
+  await week(45, 112, 50)
+  const ahead = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ahead.find({ type: 'Text', text: /^wk 45%$/ }))?.props.color).toBe('warning')
+  expect(await ahead.findAll({ type: 'Text', text: /^out .+ early$/ })).toHaveLength(2)
+  expect(await ahead.findAll({ type: 'Text', text: /^▏$/ })).toHaveLength(2)
+  await ahead.unmount()
+
+  await week(4, 162)
+  const fresh = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await fresh.find({ type: 'Text', text: /^6d18h$/ })).toBeDefined()
+  expect(await fresh.find({ type: 'Text', text: /pace|early/ })).toBeUndefined()
+  await fresh.unmount()
+
+  await week(100, 30)
+  const out = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await out.find({ type: 'Text', text: /^out until / }))?.props.color).toBe('warning')
+  expect((await out.find({ type: 'Text', text: /^wk 100%$/ }))?.props.color).toBe('error')
+  await out.unmount()
 })

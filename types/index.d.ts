@@ -14,6 +14,7 @@ export type Meter = {
   percent: number
   tokens: number | null
   resetsAt: string | null
+  isWeekly?: boolean
 }
 
 export type Gauges = {
