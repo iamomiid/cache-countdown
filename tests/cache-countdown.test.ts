@@ -9,6 +9,7 @@ const BAND = {
   component: 'AbovePrompt',
   props: {
     hasSurvey: false,
+    isCollapsed: false,
     isWorking: false,
     maxRows: 10,
     bodyColumns: 100,
@@ -427,4 +428,220 @@ test('Compact also appears once the cache is cold', { options: { ttl: '5m' } }, 
     expect(await cold.find({ type: 'Button', key: 'compact' })).toBeDefined()
     await cold.unmount()
   }
+})
+
+const HOUR = 3_600_000
+const HIT = {
+  isAnswered: true,
+  text: 'ok',
+  usage: { input_tokens: 16, output_tokens: 1, cache_read_input_tokens: 212_000, cache_creation_input_tokens: 4 },
+} as const
+
+function answerFork(on: On, counter: { forks: number }, reply: () => unknown = () => HIT) {
+  on('model.fork', () => {
+    counter.forks += 1
+
+    return { value: reply() as typeof HIT }
+  })
+}
+
+function answerToasts(on: On): string[] {
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+
+  return toasts
+}
+
+function holdAsk(args: string) {
+  return { ...ASK, command: 'hold', args }
+}
+
+test('the hold row appears five minutes before a 1h cache goes cold', { options: { ttl: '1h' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  answerBand(on)
+  answerSteps(on, CACHED)
+  answerStart(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await step($)
+
+  const early = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await early.find({ type: 'Button', key: 'hold-3h' })).toBeUndefined()
+  await early.unmount()
+
+  await clock.advance(55 * 60_000 + 1000)
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...BAND, surface })
+    for (const key of ['hold-1h', 'hold-3h', 'hold-8h', 'hold-12h', 'hold-morning', 'other', 'compact-now', 'cold']) {
+      expect(await ui.find({ type: 'Button', key })).toBeDefined()
+    }
+    expect(await ui.find({ type: 'Button', key: 'warm' })).toBeUndefined()
+    await ui.unmount()
+  }
+})
+
+test('a chip keeps the cache warm until that time, then ends', { options: { ttl: '1h' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  const counter = { forks: 0 }
+  answerBand(on)
+  answerSteps(on, CACHED)
+  answerStart(on)
+  answerFork(on, counter)
+  const toasts = answerToasts(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await step($)
+  await clock.advance(55 * 60_000 + 1000)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'hold-3h' })
+  expect((await ui.find({ type: 'Text', text: /^warm until / }))?.props.color).toBe('success')
+  expect(await ui.find({ type: 'Button', key: 'hold-3h' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'stop' })).toBeDefined()
+
+  await clock.advance(2000)
+  expect(counter.forks).toBe(1)
+
+  await clock.advance(54 * 60_000)
+  expect(counter.forks).toBe(1)
+  await clock.advance(2 * 60_000)
+  expect(counter.forks).toBe(2)
+
+  await clock.advance(2 * HOUR + 10 * 60_000)
+  expect(counter.forks).toBe(4)
+  expect(toasts.some(text => text.startsWith('Hold ended at'))).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /^warm until / })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('/hold reads durations and times of day', { options: { ttl: '1h' } }, async ($, on) => {
+  mock.clock(on, { now: START })
+  answerBand(on)
+  answerSteps(on, CACHED)
+  expect((await $.command.run(holdAsk('1h'))).text).toContain('Nothing is cached yet')
+
+  await step($)
+  expect((await $.command.run(holdAsk(''))).text).toContain('No hold.')
+  expect((await $.command.run(holdAsk('banana'))).text).toContain('Could not read "banana"')
+  expect((await $.command.run(holdAsk('30h'))).text).toContain('24 hours at most')
+  expect((await $.command.run(holdAsk('25:00'))).text).toContain('not a time of day')
+  expect((await $.command.run(holdAsk('1h30m'))).text).toContain('1h 30m from now')
+  expect((await $.command.run(holdAsk(''))).text).toContain('Keeping the cache warm until')
+  expect((await $.command.run(holdAsk('7pm'))).text).toMatch(/until (\w{3} )?19:00/)
+  expect((await $.command.run(holdAsk('07:30'))).text).toMatch(/until (\w{3} )?07:30/)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^warm until (\w{3} )?07:30$/ })).toBeDefined()
+  await ui.unmount()
+
+  expect((await $.command.run(holdAsk('off'))).text).toContain('Hold stopped')
+  expect((await $.command.run(holdAsk('off'))).text).toContain('No hold to stop')
+})
+
+test('a message from the person ends the hold, a task notification does not', { options: { ttl: '1h' } }, async ($, on) => {
+  mock.clock(on, { now: START })
+  answerBand(on)
+  answerSteps(on, CACHED)
+  on('prompt.submit', (_$, e) => ({ text: e.text }))
+  await step($)
+  await $.command.run(holdAsk('8h'))
+
+  await $.prompt.submit({ text: 'done', wait: false, origin: { kind: 'task-notification' } } as never)
+  expect((await $.command.run(holdAsk(''))).text).toContain('Keeping the cache warm until')
+
+  await $.prompt.submit({ text: 'back', wait: false, origin: { kind: 'composer' } } as never)
+  expect((await $.command.run(holdAsk(''))).text).toContain('No hold.')
+})
+
+test('a full 5-hour limit pauses the hold and says so', { options: { ttl: '1h' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  const counter = { forks: 0 }
+  answerBand(on)
+  answerSteps(on, CACHED)
+  answerStart(on)
+  answerFork(on, counter)
+  const toasts = answerToasts(on)
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  const resetsAt = new Date(START + 2 * HOUR).toISOString()
+  const measure = (percentUsed: number) =>
+    $.session.measure({
+      context: { tokens: 212_000, window: 1_000_000, percent: 21 },
+      rateLimits: [{ kind: 'five_hour', percentUsed, resetsAt }],
+      changed: ['rateLimits'],
+    })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await measure(100)
+  await step($)
+  await $.command.run(holdAsk('3h'))
+  await clock.advance(55 * 60_000 + 2000)
+  expect(counter.forks).toBe(0)
+  expect(toasts.some(text => text.includes('5-hour limit is full'))).toBe(true)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /^can't keep warm until / }))?.props.color).toBe('warning')
+
+  await measure(40)
+  await clock.advance(61_000)
+  expect(counter.forks).toBe(1)
+  expect(await ui.find({ type: 'Text', text: /^can't keep warm/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a rate-limited ping keeps retrying until the cache goes cold', { options: { ttl: '1h' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  const counter = { forks: 0 }
+  answerBand(on)
+  answerSteps(on, CACHED)
+  answerStart(on)
+  answerFork(on, counter, () => ({
+    isAnswered: false,
+    reason: 'api-error',
+    status: 429,
+    error: 'rate_limit',
+    usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+  }))
+  const toasts = answerToasts(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await step($)
+  await $.command.run(holdAsk('3h'))
+  await clock.advance(55 * 60_000 + 2000)
+  expect(counter.forks).toBe(1)
+  await clock.advance(61_000)
+  expect(counter.forks).toBe(2)
+
+  await clock.advance(5 * 60_000)
+  expect(toasts.at(-1)).toContain('went cold while the 5-hour limit was full')
+  expect(toasts.filter(text => text.includes('went cold'))).toHaveLength(1)
+  expect((await $.command.run(holdAsk(''))).text).toContain('No hold.')
+})
+
+test('Let it go cold hides the row, Other… takes a typed time', { options: { ttl: '1h' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  answerBand(on)
+  answerSteps(on, CACHED)
+  answerStart(on)
+  const toasts = answerToasts(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await step($)
+  await clock.advance(56 * 60_000)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'cold' })
+  expect(await ui.find({ type: 'Button', key: 'hold-1h' })).toBeUndefined()
+  await ui.unmount()
+
+  await step($)
+  await clock.advance(56 * 60_000)
+  const again = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await again.press({ key: 'other' })
+  expect(await again.find({ type: 'Input', key: 'back' })).toBeDefined()
+  await again.input({ key: 'back', text: 'soon' })
+  expect(toasts.at(-1)).toContain('Could not read "soon"')
+  await again.input({ key: 'back', text: '2h' })
+  expect(await again.find({ type: 'Text', text: /^warm until / })).toBeDefined()
+  expect(await again.find({ type: 'Input', key: 'back' })).toBeUndefined()
+  await again.unmount()
 })

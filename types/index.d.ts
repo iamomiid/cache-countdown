@@ -23,6 +23,21 @@ export type Gauges = {
 
 export type Busy = 'warming' | 'compacting'
 
+export type HoldIssue = 'limit' | 'missed' | 'failed'
+
+export type Hold = {
+  startedAt: number
+  until: number
+  pings: number
+  issue: HoldIssue | null
+  retryAt: number
+}
+
+export type Offer = {
+  at: number
+  mode: 'chips' | 'field' | 'dismissed'
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'cache-countdown': {
@@ -31,6 +46,8 @@ declare module 'claude-code' {
       transcript: string | null
       gauges: Gauges
       busy: Busy | null
+      hold: Hold | null
+      offer: Offer | null
     }
   }
 }

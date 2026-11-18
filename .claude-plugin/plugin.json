@@ -1,8 +1,8 @@
 {
   "name": "cache-countdown",
   "displayName": "Cache Countdown",
-  "version": "0.1.0",
-  "description": "A fuse above the prompt that burns down with the prompt cache, with context and rate limit meters and buttons to keep the cache warm or compact",
+  "version": "0.2.0",
+  "description": "A fuse above the prompt that burns down with the prompt cache, with context and rate limit meters, a hold that keeps the cache warm until you are back, and a button to compact",
   "author": {
     "name": "Omid Sayfun",
     "url": "https://github.com/iamomiid"

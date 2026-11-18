@@ -9,7 +9,7 @@ import type {
   TurnUsage,
 } from 'claude-code'
 
-import type { Busy, CacheTier, CacheTouch, Gauges, Meter } from '../types'
+import type { Busy, CacheTier, CacheTouch, Gauges, Hold, HoldIssue, Meter, Offer } from '../types'
 
 type Phase = 'warm' | 'soon' | 'cold'
 type Level = 'calm' | 'warn' | 'full'
@@ -32,14 +32,37 @@ type View = {
   note: string | null
   isNoteWarning: boolean
 }
+type HoldView = { label: string; fraction: number; issue: string | null }
+type Chip = { key: string; label: string }
+type OfferMode = 'chips' | 'field'
 type Scene = {
   view: View | null
   meters: MeterView[]
   busy: Busy | null
   canWarm: boolean
   canCompact: boolean
+  hold: HoldView | null
+  offer: OfferMode | null
+  chips: Chip[]
+  canCompactNow: boolean
 }
-type Actions = { onWarm: () => unknown; onCompact: () => unknown }
+type Actions = {
+  onWarm: () => unknown
+  onCompact: () => unknown
+  onChip: (key: string) => unknown
+  onOther: () => unknown
+  onBack: () => unknown
+  onSubmit: (text: string) => unknown
+  onCold: () => unknown
+  onStop: () => unknown
+}
+type Ping =
+  | { kind: 'warm'; served: number }
+  | { kind: 'missed'; written: number }
+  | { kind: 'limit' }
+  | { kind: 'failed' }
+  | { kind: 'nothing' }
+type Back = { until: number } | { isOff: true } | { error: string }
 
 type TranscriptRow = {
   type?: string
@@ -87,15 +110,28 @@ const COMPACT_MIN_TOKENS = 200_000
 const REFUSAL_MARKER = '$.command.run: '
 const KEEP_WARM_PROMPT = 'Reply with the single word: ok'
 const NO_GAUGES: Gauges = { tokens: null, meters: [] }
+const HOUR_MS = 60 * 60_000
+const HOLD_MIN_MS = 60_000
+const HOLD_MAX_MS = 24 * HOUR_MS
+const HOLD_RETRY_MS = 60_000
+const HOLD_HOURS = [1, 3, 8, 12] as const
+const MORNING_HOUR = 9
+const SVG_OK = '#5fbf8f'
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const
+const STOP_ORIGINS: ReadonlySet<string> = new Set(['composer', 'bridge', 'sdk'])
+const HOLD_USAGE = 'Say when you will be back: /hold 12h, /hold 90m, /hold 07:30, /hold 7pm, or /hold off.'
 
 const touch = atom({ plugin: 'cache-countdown', key: 'touch' } as const, null)
 const tiers = atom({ plugin: 'cache-countdown', key: 'tiers' } as const, [])
 const transcript = atom({ plugin: 'cache-countdown', key: 'transcript' } as const, null)
 const gauges = atom({ plugin: 'cache-countdown', key: 'gauges' } as const, NO_GAUGES)
 const busy = atom({ plugin: 'cache-countdown', key: 'busy' } as const, null)
+const hold = atom({ plugin: 'cache-countdown', key: 'hold' } as const, null)
+const offer = atom({ plugin: 'cache-countdown', key: 'offer' } as const, null)
 
 let drawn = ''
 let flying = 0
+let pinging = false
 let toastedAt = 0
 const toasted = new Set<string>()
 
@@ -132,6 +168,97 @@ function resetsOf(resetsAt: string | null, now: number): string | null {
   }
 
   return hours >= 1 ? `${hours}h${minutes % 60}m` : `${minutes}m`
+}
+
+function hhmm(date: Date): string {
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+}
+
+function timeOf(at: number, now: number): string {
+  const date = new Date(at)
+  const isToday = date.toDateString() === new Date(now).toDateString()
+
+  return isToday ? hhmm(date) : `${DAYS[date.getDay()]} ${hhmm(date)}`
+}
+
+function spanOf(ms: number): string {
+  const minutes = Math.round(ms / 60_000)
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+
+  if (hours === 0) {
+    return `${rest}m`
+  }
+
+  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`
+}
+
+function nextClock(hours: number, minutes: number, now: number): number {
+  const date = new Date(now)
+  date.setHours(hours, minutes, 0, 0)
+
+  if (date.getTime() <= now) {
+    date.setDate(date.getDate() + 1)
+  }
+
+  return date.getTime()
+}
+
+function morningOf(now: number): { until: number; label: string } {
+  const until = nextClock(MORNING_HOUR, 0, now)
+  const isToday = new Date(until).toDateString() === new Date(now).toDateString()
+
+  return { until, label: isToday ? `${MORNING_HOUR}:00` : `${MORNING_HOUR}:00 tomorrow` }
+}
+
+function backOf(text: string, now: number): Back {
+  const typed = text.trim().toLowerCase()
+
+  if (['off', 'stop', 'cancel', 'none'].includes(typed)) {
+    return { isOff: true }
+  }
+
+  const clock = /^(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)?$/.exec(typed)
+
+  if (clock !== null && (clock[2] !== undefined || clock[3] !== undefined)) {
+    const minutes = Number(clock[2] ?? 0)
+    let hours = Number(clock[1])
+
+    if (clock[3] !== undefined) {
+      hours = hours < 1 || hours > 12 ? Number.NaN : (hours % 12) + (clock[3] === 'pm' ? 12 : 0)
+    }
+
+    if (Number.isNaN(hours) || hours > 23 || minutes > 59) {
+      return { error: `${text.trim()} is not a time of day. ${HOLD_USAGE}` }
+    }
+
+    return { until: nextClock(hours, minutes, now) }
+  }
+
+  const span = /^(?:(\d+(?:\.\d+)?)\s*h(?:ours?|rs?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?$/.exec(typed)
+
+  if (span !== null && (span[1] !== undefined || span[2] !== undefined)) {
+    return { until: now + Number(span[1] ?? 0) * HOUR_MS + Number(span[2] ?? 0) * 60_000 }
+  }
+
+  return { error: typed === '' ? HOLD_USAGE : `Could not read "${text.trim()}". ${HOLD_USAGE}` }
+}
+
+function fiveHourOf(held: Gauges): Meter | null {
+  return held.meters.find(meter => meter.label === WINDOW_LABEL.five_hour) ?? null
+}
+
+function issueOf(issue: HoldIssue | null, held: Gauges, now: number): string | null {
+  if (issue === 'limit') {
+    const resetsAt = fiveHourOf(held)?.resetsAt ?? null
+    const at = resetsAt === null ? Number.NaN : Date.parse(resetsAt)
+
+    return Number.isNaN(at) || at <= now
+      ? "can't keep warm: 5-hour limit full"
+      : `can't keep warm until ${timeOf(at, now)}: 5-hour limit full`
+  }
+
+  return issue === 'failed' ? 'last keep-warm failed, retrying' : null
 }
 
 function tint(color: string | null): { color?: string } {
@@ -375,11 +502,11 @@ async function note(
   }
 }
 
-async function keepWarm($: EngineInterface): Promise<void> {
+async function ping($: EngineInterface): Promise<Ping> {
   const last = await read($, touch)
 
-  if (last === null || (await read($, busy)) !== null) {
-    return
+  if (last === null) {
+    return { kind: 'nothing' }
   }
 
   await update($, busy, () => 'warming')
@@ -389,9 +516,11 @@ async function keepWarm($: EngineInterface): Promise<void> {
     const reply = await $.model.fork({ prompt: KEEP_WARM_PROMPT })
 
     if (!reply.isAnswered && reply.reason === 'nothing-to-fork') {
-      $.ui.toast('Nothing to keep warm yet.')
+      return { kind: 'nothing' }
+    }
 
-      return
+    if (!reply.isAnswered && reply.reason === 'api-error' && reply.error === 'rate_limit') {
+      return { kind: 'limit' }
     }
 
     const served = reply.usage.cache_read_input_tokens
@@ -407,20 +536,205 @@ async function keepWarm($: EngineInterface): Promise<void> {
         isRebuilt: false,
       }
       await update($, touch, () => next)
-      $.ui.toast(`Cache kept warm: ${compactOf(served)} tokens read from it.`)
 
-      return
+      return { kind: 'warm', served }
     }
 
-    $.ui.toast(
-      served + written === 0
-        ? 'Keep warm did not reach the model. The countdown is unchanged.'
-        : `Keep warm missed the cache: ${compactOf(written)} tokens were written again. The countdown is unchanged.`,
-      { timeoutMs: 12_000 },
-    )
+    return served + written === 0 ? { kind: 'failed' } : { kind: 'missed', written }
   } finally {
     await update($, busy, () => null)
   }
+}
+
+async function keepWarm($: EngineInterface): Promise<void> {
+  if ((await read($, touch)) === null || (await read($, busy)) !== null || pinging) {
+    return
+  }
+
+  pinging = true
+
+  try {
+    const outcome = await ping($)
+
+    if (outcome.kind === 'nothing') {
+      $.ui.toast('Nothing to keep warm yet.')
+    } else if (outcome.kind === 'warm') {
+      $.ui.toast(`Cache kept warm: ${compactOf(outcome.served)} tokens read from it.`)
+    } else if (outcome.kind === 'limit') {
+      $.ui.toast('Keep warm hit the 5-hour limit. The countdown is unchanged.', { timeoutMs: 12_000 })
+    } else {
+      $.ui.toast(
+        outcome.kind === 'failed'
+          ? 'Keep warm did not reach the model. The countdown is unchanged.'
+          : `Keep warm missed the cache: ${compactOf(outcome.written)} tokens were written again. The countdown is unchanged.`,
+        { timeoutMs: 12_000 },
+      )
+    }
+  } finally {
+    pinging = false
+  }
+}
+
+async function startHold(
+  $: EngineInterface,
+  until: number,
+  forced: CacheTier | null,
+): Promise<string | null> {
+  const last = await read($, touch)
+  const now = await $.clock.now()
+
+  if (last === null) {
+    return 'Nothing is cached yet, so there is nothing to keep warm.'
+  }
+
+  const view = viewOf(last, forced, await read($, tiers), (await read($, gauges)).tokens, now)
+
+  if (view.phase === 'cold') {
+    return 'The cache is already cold. Send a message to cache the conversation again, then hold.'
+  }
+
+  if (until - now < HOLD_MIN_MS) {
+    return 'That is less than a minute away.'
+  }
+
+  if (until - now > HOLD_MAX_MS) {
+    return 'A hold lasts 24 hours at most. Past about a day and a half, the pings cost more than writing the cache again.'
+  }
+
+  const next: Hold = { startedAt: now, until, pings: 0, issue: null, retryAt: 0 }
+  await update($, hold, () => next)
+  await update($, offer, () => null)
+
+  return null
+}
+
+async function endHold($: EngineInterface, text: string | null): Promise<void> {
+  if ((await read($, hold)) === null) {
+    return
+  }
+
+  await update($, hold, () => null)
+
+  if (text !== null) {
+    $.ui.toast(text, { timeoutMs: 12_000 })
+  }
+}
+
+async function chooseOffer($: EngineInterface, mode: Offer['mode']): Promise<void> {
+  const last = await read($, touch)
+
+  if (last !== null) {
+    const next: Offer = { at: last.at, mode }
+    await update($, offer, () => next)
+  }
+}
+
+async function holdFromChip($: EngineInterface, key: string, forced: CacheTier | null): Promise<void> {
+  const now = await $.clock.now()
+  const hours = HOLD_HOURS.find(count => key === `hold-${count}h`)
+  const until = hours === undefined ? morningOf(now).until : now + hours * HOUR_MS
+  const refused = await startHold($, until, forced)
+
+  if (refused !== null) {
+    $.ui.toast(refused)
+  }
+}
+
+async function holdFromText($: EngineInterface, text: string, forced: CacheTier | null): Promise<void> {
+  const back = backOf(text, await $.clock.now())
+
+  if ('error' in back) {
+    $.ui.toast(back.error, { timeoutMs: 12_000 })
+
+    return
+  }
+
+  if ('isOff' in back) {
+    await endHold($, null)
+    await chooseOffer($, 'chips')
+
+    return
+  }
+
+  const refused = await startHold($, back.until, forced)
+
+  if (refused !== null) {
+    $.ui.toast(refused, { timeoutMs: 12_000 })
+  }
+}
+
+async function guardHold($: EngineInterface, last: CacheTouch, view: View, held: Gauges, now: number): Promise<void> {
+  const current = await read($, hold)
+
+  if (current === null) {
+    return
+  }
+
+  if (now >= current.until) {
+    await endHold(
+      $,
+      view.phase === 'cold'
+        ? `Hold ended at ${timeOf(current.until, now)}.`
+        : `Hold ended at ${timeOf(current.until, now)}. The cache stays warm for ${clockOf(view.leftMs)} more.`,
+    )
+
+    return
+  }
+
+  if (view.phase === 'cold') {
+    toasted.add(`${view.tier}:cold`)
+    await endHold(
+      $,
+      current.issue === 'limit'
+        ? 'Hold ended: the cache went cold while the 5-hour limit was full.'
+        : 'Hold ended: the cache went cold.',
+    )
+
+    return
+  }
+
+  const outlivesHold = last.at + TTL_MS[view.tier] >= current.until
+  const isDue = view.leftMs <= WARN_MS[view.tier] && now >= current.retryAt
+
+  if (outlivesHold || !isDue || pinging || flying > 0 || (await read($, busy)) !== null) {
+    return
+  }
+
+  const five = fiveHourOf(held)
+
+  if (five !== null && five.percent >= 100) {
+    await holdIssue($, current, 'limit', now)
+
+    return
+  }
+
+  pinging = true
+
+  try {
+    const outcome = await ping($)
+
+    if (outcome.kind === 'warm') {
+      const next: Hold = { ...current, pings: current.pings + 1, issue: null, retryAt: 0 }
+      await update($, hold, () => next)
+    } else if (outcome.kind === 'missed') {
+      await endHold($, 'Hold stopped: the keep-warm request missed the cache and wrote it again.')
+    } else {
+      await holdIssue($, current, outcome.kind === 'limit' ? 'limit' : 'failed', now)
+    }
+  } finally {
+    pinging = false
+  }
+}
+
+async function holdIssue($: EngineInterface, current: Hold, issue: HoldIssue, now: number): Promise<void> {
+  if (issue === 'limit' && current.issue !== 'limit') {
+    $.ui.toast("Can't keep the cache warm: the 5-hour limit is full. Retrying every minute.", {
+      timeoutMs: 12_000,
+    })
+  }
+
+  const next: Hold = { ...current, issue, retryAt: now + HOLD_RETRY_MS }
+  await update($, hold, () => next)
 }
 
 function refusalOf(error: unknown): string {
@@ -493,7 +807,11 @@ async function tick(
   }
 
   const view = viewOf(last, forced, await read($, tiers), held.tokens, now)
-  const label = [view.time, view.life, view.note, Math.round(view.fraction * FUSE_PX), meters].join()
+  await guardHold($, last, view, held, now)
+  const current = await read($, hold)
+  const holding =
+    current === null ? '' : [current.until, current.issue, Math.round(holdFraction(current, now) * FUSE_PX)].join(':')
+  const label = [view.time, view.life, view.note, Math.round(view.fraction * FUSE_PX), meters, holding].join()
 
   if (label !== drawn) {
     drawn = label
@@ -502,9 +820,15 @@ async function tick(
 
   const isWorthIt = held.tokens === null || held.tokens >= WORTH_ACTING_TOKENS
 
-  if (isToasting && view.isKnown && isWorthIt && flying === 0) {
+  if (isToasting && view.isKnown && isWorthIt && flying === 0 && current === null) {
     announce($, view)
   }
+}
+
+function holdFraction(current: Hold, now: number): number {
+  const span = current.until - current.startedAt
+
+  return span <= 0 ? 0 : Math.max(0, Math.min(1, (current.until - now) / span))
 }
 
 async function sceneOf($: EngineInterface, forced: CacheTier | null): Promise<Scene | null> {
@@ -520,23 +844,149 @@ async function sceneOf($: EngineInterface, forced: CacheTier | null): Promise<Sc
 
   const tokens = held.tokens ?? 0
   const isColdAndLarge = view !== null && view.phase === 'cold' && tokens >= WORTH_ACTING_TOKENS
+  const isWorthIt = held.tokens === null || held.tokens >= WORTH_ACTING_TOKENS
+  const current = await read($, hold)
+  const chosen = await read($, offer)
+  const isThisTouch = last !== null && chosen !== null && chosen.at === last.at
+  const canOffer =
+    view !== null && current === null && view.tier === '1h' && view.phase === 'soon' && isWorthIt
+  const offerMode: OfferMode | null =
+    isThisTouch && chosen.mode === 'field' && view?.phase !== 'cold'
+      ? 'field'
+      : canOffer && !(isThisTouch && chosen.mode === 'dismissed')
+        ? 'chips'
+        : null
+  const morning = morningOf(now)
 
   return {
     view,
     meters: held.meters.map(meter => meterViewOf(meter, now)),
     busy: await read($, busy),
-    canWarm: view !== null && view.phase === 'soon',
-    canCompact: tokens > COMPACT_MIN_TOKENS || isColdAndLarge,
+    canWarm: view !== null && view.phase === 'soon' && view.tier === '5m' && current === null,
+    canCompact: (tokens > COMPACT_MIN_TOKENS || isColdAndLarge) && offerMode === null,
+    hold:
+      current === null
+        ? null
+        : {
+            label: `warm until ${timeOf(current.until, now)}`,
+            fraction: holdFraction(current, now),
+            issue: issueOf(current.issue, held, now),
+          },
+    offer: offerMode,
+    chips: [
+      ...HOLD_HOURS.map(count => ({ key: `hold-${count}h`, label: `${count}h` })),
+      { key: 'hold-morning', label: morning.label },
+    ],
+    canCompactNow: isWorthIt,
   }
+}
+
+function holdSvg(hold: HoldView): string {
+  return barSvg(FUSE_PX, SEGMENTS['1h'], hold.fraction, SVG_OK, SVG_CALM)
+}
+
+function offerDesktop(table: Elements['desktop'], scene: Scene, actions: Actions): RenderElement | null {
+  const { Box, Text, Button, Input } = table
+
+  if (scene.offer === 'field') {
+    return (
+      <Box columnGap={1} alignItems="center">
+        <Input
+          key="back"
+          label="Back at"
+          placeholder="12h, 90m, 07:30 or 7pm"
+          submitLabel="keep warm"
+          autoFocus
+          onSubmit={actions.onSubmit}
+        />
+        <Button key="chips" label="Back" onPress={actions.onBack} />
+      </Box>
+    )
+  }
+
+  if (scene.offer !== 'chips') {
+    return null
+  }
+
+  return (
+    <Box columnGap={1} flexWrap="wrap" alignItems="center">
+      <Text>Back in</Text>
+      {scene.chips.map(chip => (
+        <Button key={chip.key} label={chip.label} onPress={() => actions.onChip(chip.key)} />
+      ))}
+      <Button key="other" label="Other…" onPress={actions.onOther} />
+      {scene.canCompactNow && scene.busy === null && (
+        <Button key="compact-now" label="Compact now" onPress={actions.onCompact} />
+      )}
+      <Button key="cold" label="Let it go cold" onPress={actions.onCold} />
+    </Box>
+  )
+}
+
+function offerTerminal(table: Elements['terminal'], scene: Scene, actions: Actions): RenderElement | null {
+  const { Box, Text, Button, Input } = table
+
+  if (scene.offer === 'field') {
+    return (
+      <Box columnGap={1}>
+        <Input
+          key="back"
+          label="back at"
+          placeholder="12h, 90m, 07:30 or 7pm"
+          submitLabel="keep warm"
+          autoFocus
+          onSubmit={actions.onSubmit}
+        />
+        <Button key="chips" label="back" onPress={actions.onBack} />
+      </Box>
+    )
+  }
+
+  if (scene.offer !== 'chips') {
+    return null
+  }
+
+  return (
+    <Box columnGap={2} flexWrap="wrap">
+      <Text>back in</Text>
+      {scene.chips.map(chip => (
+        <Button key={chip.key} label={chip.label} onPress={() => actions.onChip(chip.key)} />
+      ))}
+      <Button key="other" label="other…" onPress={actions.onOther} />
+      <Text>│</Text>
+      {scene.canCompactNow && scene.busy === null && (
+        <Button key="compact-now" label="Compact now" onPress={actions.onCompact} />
+      )}
+      <Button key="cold" label="Let it go cold" onPress={actions.onCold} />
+    </Box>
+  )
 }
 
 function drawDesktop(table: Elements['desktop'], scene: Scene, actions: Actions): RenderElement {
   const { Box, Text, Svg, Button } = table
-  const { view, meters } = scene
+  const { view, meters, hold: holding } = scene
+  const offered = offerDesktop(table, scene, actions)
 
-  return (
+  const row = (
     <Box columnGap={3} flexWrap="wrap" alignItems="center" justifyContent="space-between">
-      {view !== null && (
+      {holding !== null && (
+        <Box columnGap={1} alignItems="center">
+          <Text bold color="success">
+            {holding.label}
+          </Text>
+          <Svg
+            source={holdSvg(holding)}
+            alt={`${Math.round(holding.fraction * 100)}% of the hold left`}
+            width={FUSE_PX}
+            height={BAR_HEIGHT_PX}
+          />
+          {holding.issue !== null && <Text color="warning">{holding.issue}</Text>}
+          {scene.busy === 'warming' && <Text>warming</Text>}
+          <Button key="change" label="Change" onPress={actions.onOther} />
+          <Button key="stop" label="Stop" onPress={actions.onStop} />
+        </Box>
+      )}
+      {holding === null && view !== null && (
         <Box columnGap={1} alignItems="center">
           <Text bold {...tint(PHASE_COLOR[view.phase])}>
             {view.time}
@@ -586,16 +1036,42 @@ function drawDesktop(table: Elements['desktop'], scene: Scene, actions: Actions)
       </Box>
     </Box>
   )
+
+  return offered === null ? (
+    row
+  ) : (
+    <Box flexDirection="column" rowGap={1}>
+      {row}
+      {offered}
+    </Box>
+  )
 }
 
 function drawTerminal(table: Elements['terminal'], scene: Scene, actions: Actions): RenderElement {
   const { Box, Text, Button } = table
-  const { view, meters } = scene
+  const { view, meters, hold: holding } = scene
   const lit = view === null ? 0 : Math.ceil(view.fraction * TERMINAL_CELLS)
+  const held = holding === null ? 0 : Math.ceil(holding.fraction * TERMINAL_CELLS)
+  const offered = offerTerminal(table, scene, actions)
 
-  return (
+  const row = (
     <Box columnGap={2} flexWrap="wrap">
-      {view !== null && (
+      {holding !== null && (
+        <Box columnGap={1}>
+          <Text bold color="success">
+            {holding.label}
+          </Text>
+          <Box>
+            <Text color="success">{'━'.repeat(held)}</Text>
+            <Text>{'─'.repeat(TERMINAL_CELLS - held)}</Text>
+          </Box>
+          {holding.issue !== null && <Text color="warning">{holding.issue}</Text>}
+          {scene.busy === 'warming' && <Text>warming</Text>}
+          <Button key="change" label="change" onPress={actions.onOther} />
+          <Button key="stop" label="stop" onPress={actions.onStop} />
+        </Box>
+      )}
+      {holding === null && view !== null && (
         <Box columnGap={1}>
           <Text bold {...tint(PHASE_COLOR[view.phase])}>
             {view.time}
@@ -626,6 +1102,15 @@ function drawTerminal(table: Elements['terminal'], scene: Scene, actions: Action
       ))}
     </Box>
   )
+
+  return offered === null ? (
+    row
+  ) : (
+    <Box flexDirection="column">
+      {row}
+      {offered}
+    </Box>
+  )
 }
 
 export const register: Register = (on, options) => {
@@ -643,6 +1128,11 @@ export const register: Register = (on, options) => {
       description: 'Show how long the prompt cache stays warm',
       immediate: true,
     })
+    await $.command.register({
+      name: 'hold',
+      description: 'Keep the prompt cache warm until you are back: /hold 12h, /hold 07:30, /hold off',
+      immediate: true,
+    })
 
     return next(e)
   })
@@ -657,6 +1147,51 @@ export const register: Register = (on, options) => {
     await remember($, e.transcript_path)
 
     return next(e)
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    const isPerson = STOP_ORIGINS.has(e.origin.kind) && e.command === undefined && e.isMeta !== true
+
+    if (isPerson) {
+      await endHold($, null)
+      await update($, offer, () => null)
+    }
+
+    return next(e)
+  })
+
+  on('command.run', { command: 'hold' }, async ($, e) => {
+    const now = await $.clock.now()
+    const current = await read($, hold)
+
+    if (e.args.trim() === '') {
+      return {
+        text:
+          current === null
+            ? `No hold. ${HOLD_USAGE}`
+            : `Keeping the cache warm until ${timeOf(current.until, now)}, ${spanOf(current.until - now)} from now, ${current.pings} ${current.pings === 1 ? 'ping' : 'pings'} so far. /hold off stops it.`,
+      }
+    }
+
+    const back = backOf(e.args, now)
+
+    if ('error' in back) {
+      return { text: back.error }
+    }
+
+    if ('isOff' in back) {
+      await endHold($, null)
+
+      return { text: current === null ? 'No hold to stop.' : 'Hold stopped. The cache goes cold on its usual schedule.' }
+    }
+
+    const refused = await startHold($, back.until, forced)
+
+    return {
+      text:
+        refused ??
+        `Keeping the cache warm until ${timeOf(back.until, now)}, ${spanOf(back.until - now)} from now. Sending a message ends the hold.`,
+    }
   })
 
   on('classic.Stop', async ($, e, next) => {
@@ -760,6 +1295,12 @@ export const register: Register = (on, options) => {
     const actions: Actions = {
       onWarm: () => keepWarm($),
       onCompact: () => compactNow($),
+      onChip: key => holdFromChip($, key, forced),
+      onOther: () => chooseOffer($, 'field'),
+      onBack: () => chooseOffer($, 'chips'),
+      onSubmit: text => holdFromText($, text, forced),
+      onCold: () => chooseOffer($, 'dismissed'),
+      onStop: () => endHold($, null),
     }
 
     if (e.surface === 'desktop') {
